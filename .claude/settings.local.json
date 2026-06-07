@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ros2 topic *)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+ 1. Obstacle-flag navigation loop (unresolved)
+  When navigating to the flag and an obstacle is nearby (even slightly off-path), obstaculo_a_frente
+  triggers, the robot tries to dodge, the obstacle briefly leaves the front cone, and it immediately
+  resumes flag navigation — repeating indefinitely. Two attempts at a CIRCUMNAVIGATING state were
+  reverted because the exit condition (_path_to_flag_clear()) returned True prematurely due to
+  bandeira_pos shifting as the robot turns.
+
+  2. No tip-over recovery (reverted by request)
+  The robot can be tipped over by obstacles. An IMU-based recovery was implemented and reverted.
+  Currently there is no protection against this.
+
+  3. Wall-following inconsistency (partially addressed)
+  The proactive avoidance (alert zone at 0.70 m) was interfering with normal wall-following behavior
+  at corners. The span-based wall/obstacle classification was added to mitigate this — walls produce
+  a wide LiDAR arc and get treated as corners, small obstacles produce a narrow arc and get
+  proportional steering. May still have edge cases.
+
+  4. Flag color uncertainty (never tested)
+  The flag detector uses BGR (227±10, 73±10, 0±10) copied from the prm students' package. The
+  prm_2026 base template used a different color (171, 242, 0). If the 2026 arena uses a different
+  flag color, detection will fail entirely.
