@@ -53,8 +53,12 @@ class FlagDetector(Node):
                     cx = int(M['m10'] / M['m00'])
                     pos_norm = cx / w
                     _, y_bb, _, h_bb = cv2.boundingRect(c)
+                    # Full-mask height: span from topmost to bottommost flag pixel,
+                    # unaffected by the gun barrel splitting the contour in two.
+                    ys = np.where(mask > 0)[0]
+                    h_mask = int(ys.max() - ys.min()) + 1 if len(ys) > 0 else h_bb
                     self.pub_detected.publish(
-                        String(data=f'detected:{pos_norm:.2f}:{area:.0f}:{h_bb}')
+                        String(data=f'detected:{pos_norm:.2f}:{area:.0f}:{h_bb}:{h_mask}')
                     )
 
 

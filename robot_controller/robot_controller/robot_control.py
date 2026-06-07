@@ -31,6 +31,14 @@ GRID_SIZE               = 100    # must match robot_mapper
 GRID_RESOLUTION         = 0.2   # m/cell — must match robot_mapper
 OBSTACLE_INFLATE_RADIUS = 1     # cells (= 0.4 m safety margin)
 WAYPOINT_TOLERANCE      = 0.20  # m
+CLOSE_ENOUGH            = 0.7   # m — camera distance to hand off to POSITION_TO_COLLECT
+TARGET_DIST             = 0.35  # m — final stop distance from flag
+ANGULAR_ALIGN_THRESH    = 0.15  # normalised error — flag must be this centred
+DIST_TOLERANCE          = 0.05  # m
+CREEP_SPEED             = 0.05  # m/s
+KP_ANGULAR_ALIGN        = 1.0
+DONE_TICKS              = 10    # consecutive ticks at goal before mission complete
+POSITION_MAX_TICKS      = 200   # timeout (~20 s)
 WAYPOINT_STRIDE         = 2
 REPLAN_INTERVAL         = 50    # ticks between periodic re-plans (~5 s)
 CAMERA_FOV              = 1.57  # rad (90°) horizontal FOV
@@ -43,6 +51,7 @@ class State(str, Enum):
     EXPLORING           = 'EXPLORING'
     FLAG_DETECTED       = 'FLAG_DETECTED'
     NAVIGATING_TO_FLAG  = 'NAVIGATING_TO_FLAG'
+    POSITION_TO_COLLECT = 'POSITION_TO_COLLECT'
     NEAR_FLAG           = 'NEAR_FLAG'
 
 
@@ -69,7 +78,8 @@ class RobotControl(Node):
         self.lidar_data     = []
         self.flag_pos       = 0.5
         self.flag_area      = 0.0
-        self.flag_height    = 0     # bounding-box height in pixels
+        self.flag_height      = 0   # bounding-box height in pixels (largest contour)
+        self.flag_height_full = 0   # full mask height — unaffected by barrel occlusion
 
         # ── Relative heading (wall-follow only) ────────────────────────────────
         self.yaw         = 0.0
@@ -92,6 +102,12 @@ class RobotControl(Node):
         self._last_flag_time    = None   # rclpy.Time of last flag detection message
         self._last_turn_dir     = -0.5   # held turn direction for _open_side_turn hysteresis
         self._flag_detect_ticks = 0      # ticks spent stopped in FLAG_DETECTED waiting for map
+
+        # ── POSITION_TO_COLLECT ─────────────────────────────────────────────────
+        self._done_ticks   = 0
+        self._pos_ticks    = 0
+        self.last_cam_dist = float('inf')
+        self.last_flag_err = 0.0
 
     # ── Sensor callbacks ───────────────────────────────────────────────────────
 
@@ -127,9 +143,10 @@ class RobotControl(Node):
         if msg.data.startswith('detected:'):
             try:
                 parts            = msg.data.split(':')
-                self.flag_pos    = float(parts[1])
-                self.flag_area   = float(parts[2]) if len(parts) >= 3 else 0.0
-                self.flag_height = int(float(parts[3])) if len(parts) >= 4 else 0
+                self.flag_pos         = float(parts[1])
+                self.flag_area        = float(parts[2]) if len(parts) >= 3 else 0.0
+                self.flag_height      = int(float(parts[3])) if len(parts) >= 4 else 0
+                self.flag_height_full = int(float(parts[4])) if len(parts) >= 5 else self.flag_height
                 self._last_flag_time = self.get_clock().now()
                 if self.state == State.EXPLORING:
                     self.state = State.FLAG_DETECTED
@@ -183,6 +200,9 @@ class RobotControl(Node):
         elif self.state == State.NAVIGATING_TO_FLAG:
             twist = self._navigate_to_flag()
 
+        elif self.state == State.POSITION_TO_COLLECT:
+            twist = self._position_to_collect()
+
         elif self.state == State.NEAR_FLAG:
             self.get_logger().info('State: NEAR_FLAG — stopped.')
 
@@ -207,13 +227,16 @@ class RobotControl(Node):
     def _navigate_to_flag(self) -> Twist:
         self.get_logger().info('State: NAVIGATING_TO_FLAG')
 
-        distance = self._flag_distance()
-        if distance < FLAG_STOP_DISTANCE:
-            self.state = State.NEAR_FLAG
-            self.get_logger().info(
-                f'Flag reached at {distance:.2f} m — mission complete.'
-            )
-            return Twist()
+        if self._flag_visible() and self.flag_height >= MIN_FLAG_HEIGHT:
+            cam_dist = K_FLAG_HEIGHT / self.flag_height
+            if cam_dist < CLOSE_ENOUGH:
+                self.state       = State.POSITION_TO_COLLECT
+                self._done_ticks = 0
+                self._pos_ticks  = 0
+                self.last_cam_dist = cam_dist
+                self.last_flag_err = self.flag_pos - CENTER_POS
+                self.get_logger().info(f'Switching to POSITION_TO_COLLECT — cam_dist={cam_dist:.2f} m')
+                return Twist()
 
         # Refine flag world position from camera bounding-box height while flag is visible.
         # Pinhole model: dist = K / pixel_height — flag-specific, not confused by walls.
@@ -265,11 +288,17 @@ class RobotControl(Node):
             self.waypoint_idx += 1
             if self.waypoint_idx >= len(self.waypoints):
                 self.get_logger().info('A* waypoints exhausted')
-                # If flag is not visible from here, the A* goal was wrong — replan
-                if not self._flag_visible() and self.flag_world_pos is not None:
+                already_close = (
+                    self.flag_world_pos is not None and
+                    math.sqrt((self.flag_world_pos[0] - self.robot_x) ** 2 +
+                              (self.flag_world_pos[1] - self.robot_y) ** 2) <= CLOSE_ENOUGH
+                )
+                if not self._flag_visible() and self.flag_world_pos is not None and not already_close:
                     self.get_logger().warn('Flag not visible at goal — replanning A*')
                     self._plan_path_to_flag()
                 else:
+                    if already_close:
+                        self.get_logger().info('Already within close range — handing off to visual servo')
                     self.waypoints = []
             return Twist()   # one-tick pause while advancing index
 
@@ -307,6 +336,59 @@ class RobotControl(Node):
             # zero only when flag is more than 60% off-centre (hard to correct while moving).
             twist.linear.x  = max(0.0, 0.3 * (1.0 - abs(error) / 0.3)) if abs(error) < 0.3 else 0.0
         return twist
+
+    def _position_to_collect(self) -> Twist:
+        self._pos_ticks += 1
+        if self._pos_ticks >= POSITION_MAX_TICKS:
+            self.get_logger().warn('POSITION_TO_COLLECT timeout — back to NAVIGATING_TO_FLAG')
+            self.state       = State.NAVIGATING_TO_FLAG
+            self._done_ticks = 0
+            self._pos_ticks  = 0
+            return Twist()
+
+        # Use full mask height here — unaffected by barrel splitting the contour
+        if self._flag_visible() and self.flag_height_full >= MIN_FLAG_HEIGHT:
+            self.last_flag_err = self.flag_pos - CENTER_POS
+            self.last_cam_dist = K_FLAG_HEIGHT / self.flag_height_full
+
+        err   = self.last_flag_err
+        twist = Twist()
+
+        # Step 1 — align: rotate until flag is centred
+        if abs(err) > ANGULAR_ALIGN_THRESH:
+            twist.angular.z = max(-0.4, min(0.4, -KP_ANGULAR_ALIGN * err))
+            self._done_ticks = 0
+            return twist
+        else:
+            twist.angular.z = 0.0
+
+        # Step 2 — approach: creep forward/backward to TARGET_DIST.
+        # Also stop if front LiDAR detects the flag base closer than TARGET_DIST —
+        # camera becomes unreliable when flag exits the bottom of the frame.
+        front_vals = [self.lidar_data[i] for i in list(range(0, 30)) + list(range(330, 360))
+                      if i < len(self.lidar_data)
+                      and math.isfinite(self.lidar_data[i]) and self.lidar_data[i] > 0.0]
+        front_min = min(front_vals) if front_vals else float('inf')
+        dist_err = self.last_cam_dist - TARGET_DIST
+        if abs(dist_err) > DIST_TOLERANCE and front_min > TARGET_DIST:
+            twist.linear.x = CREEP_SPEED if dist_err > 0 else -CREEP_SPEED
+            self._done_ticks = 0
+            return twist
+
+        # Step 3 — confirm: hold position for DONE_TICKS consecutive ticks
+        self._done_ticks += 1
+        if self._done_ticks >= DONE_TICKS:
+            if not self._flag_visible():
+                self.get_logger().warn('Stopped but flag not visible — obstacle, not flag. Re-navigating.')
+                self.state       = State.NAVIGATING_TO_FLAG
+                self._done_ticks = 0
+                self._pos_ticks  = 0
+            else:
+                self.get_logger().info(
+                    f'FLAG REACHED — dist={self.last_cam_dist:.2f} m, err={err:.3f}'
+                )
+                self.state = State.NEAR_FLAG
+        return twist  # zero while confirming
 
     # ── Reactive helpers ───────────────────────────────────────────────────────
 
