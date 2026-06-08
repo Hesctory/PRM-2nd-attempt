@@ -7,6 +7,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import Pose, PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from visualization_msgs.msg import Marker
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import String
@@ -60,8 +61,9 @@ class RobotControl(Node):
     def __init__(self):
         super().__init__('robot_control')
 
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.path_pub    = self.create_publisher(Path,  '/astar_path', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist,  '/cmd_vel',    10)
+        self.path_pub    = self.create_publisher(Path,   '/astar_path', 10)
+        self.goal_pub    = self.create_publisher(Marker, '/astar_goal', 10)
 
         self.create_subscription(LaserScan,     '/scan',                 self.scan_callback,  10)
         self.create_subscription(Imu,           '/imu',                  self.imu_callback,   10)
@@ -102,6 +104,7 @@ class RobotControl(Node):
         self._last_flag_time    = None   # rclpy.Time of last flag detection message
         self._last_turn_dir     = -0.5   # held turn direction for _open_side_turn hysteresis
         self._flag_detect_ticks = 0      # ticks spent stopped in FLAG_DETECTED waiting for map
+        self._flag_creep_ticks  = 0      # ticks of forward creep after map timeout
 
         # ── POSITION_TO_COLLECT ─────────────────────────────────────────────────
         self._done_ticks   = 0
@@ -150,6 +153,8 @@ class RobotControl(Node):
                 self._last_flag_time = self.get_clock().now()
                 if self.state == State.EXPLORING:
                     self.state = State.FLAG_DETECTED
+                    self._flag_detect_ticks = 0
+                    self._flag_creep_ticks  = 0
             except Exception as e:
                 self.get_logger().warn(f'Invalid format on /flag_detected: {e}')
 
@@ -181,21 +186,29 @@ class RobotControl(Node):
             twist = self._wall_follow()
 
         elif self.state == State.FLAG_DETECTED:
-            self._flag_detect_ticks += 1
             if self.flag_world_pos is not None:
                 # Map has a confirmed flag cell — position is reliable, start navigating
                 self.get_logger().info(
                     f'FLAG_DETECTED: flag mapped after {self._flag_detect_ticks} ticks — starting navigation'
                 )
                 self._flag_detect_ticks = 0
+                self._flag_creep_ticks  = 0
                 self.state = State.NAVIGATING_TO_FLAG
                 self._start_flag_navigation()
-            elif self._flag_detect_ticks > 30:
-                # 3 s timeout — map never got a clean cell, fall back to EXPLORING
-                self.get_logger().warn('FLAG_DETECTED: map timeout — returning to EXPLORING')
-                self._flag_detect_ticks = 0
-                self.state = State.EXPLORING
-            # twist stays zero: robot is stopped while waiting
+            elif self._flag_creep_ticks > 0:
+                # Creeping forward to bring flag within LiDAR range
+                if not self.obstacle_ahead:
+                    twist.linear.x = 0.2
+                self._flag_creep_ticks -= 1
+                if self._flag_creep_ticks == 0:
+                    self.get_logger().info('FLAG_DETECTED: crept forward — retrying')
+                    self._flag_creep_ticks = 10  # keep creeping, no 3 s wait
+            else:
+                self._flag_detect_ticks += 1
+                if self._flag_detect_ticks > 30:
+                    self.get_logger().warn('FLAG_DETECTED: map timeout — creeping forward to close range')
+                    self._flag_detect_ticks = 0
+                    self._flag_creep_ticks  = 10  # 1 s of forward motion
 
         elif self.state == State.NAVIGATING_TO_FLAG:
             twist = self._navigate_to_flag()
@@ -309,7 +322,7 @@ class RobotControl(Node):
         if front_vals and min(front_vals) < AVOID_DISTANCE:
             target_bearing = math.atan2(dy, dx)
             heading_err    = abs(self._angle_diff(target_bearing, self.robot_heading))
-            if heading_err < 0.5:
+            if heading_err < 0.535:
                 self.get_logger().info('Emergency obstacle on waypoint path — requesting A* re-plan')
                 self._replan_requested = True
                 twist           = Twist()
@@ -578,6 +591,29 @@ class RobotControl(Node):
             ps.pose.orientation.w = 1.0
             path_msg.poses.append(ps)
         self.path_pub.publish(path_msg)
+
+        # Publish goal cell as a coloured cube in RViz
+        g_gx, g_gy = goal
+        goal_wx, goal_wy = self._grid_to_world(g_gx, g_gy)
+        m = Marker()
+        m.header.frame_id = 'map'
+        m.header.stamp    = now
+        m.ns              = 'astar_goal'
+        m.id              = 0
+        m.type            = Marker.CUBE
+        m.action          = Marker.ADD
+        m.pose.position.x = goal_wx
+        m.pose.position.y = goal_wy
+        m.pose.position.z = 0.1
+        m.pose.orientation.w = 1.0
+        m.scale.x = GRID_RESOLUTION
+        m.scale.y = GRID_RESOLUTION
+        m.scale.z = 0.1
+        m.color.r = 1.0
+        m.color.g = 0.0
+        m.color.b = 0.0
+        m.color.a = 1.0
+        self.goal_pub.publish(m)
 
     def _astar(self, start: tuple, goal: tuple) -> list:
         s_gx, s_gy = start

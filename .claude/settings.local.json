@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "Bash(ros2 topic *)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(ros2 node *)",
+      "Bash(ros2 run *)",
+      "Bash(python3 -)",
+      "Bash(kill %1)",
+      "Bash(wait)",
+      "Bash(awk 'NR>=1 && NR<=40')",
+      "Bash(sort -k6,7)",
+      "Bash(awk '$5 > 50000 {print}')",
+      "Bash(grep -v \"^$\\\\|State: NAVIGATING\")"
     ]
   }
 }
