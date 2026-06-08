@@ -161,9 +161,13 @@ class RobotControl(Node):
     def _map_callback(self, msg: OccupancyGrid):
         raw = np.array(msg.data, dtype=np.int8).reshape(msg.info.height, msg.info.width)
 
-        # Derive flag world position from cells marked 50 by the mapper
+        # Derive flag world position from cells marked 50 by the mapper.
+        # Only update when camera can't see the flag — when camera is active it
+        # refines flag_world_pos every tick and is more accurate than the grid
+        # centroid, which can be corrupted by a single bad ray permanently.
+        # Grid serves as memory for when the flag is out of camera view.
         flag_cells = np.argwhere(raw == 50)
-        if len(flag_cells) > 0:
+        if len(flag_cells) > 0 and not self._flag_visible():
             gy_m = float(np.mean(flag_cells[:, 0]))
             gx_m = float(np.mean(flag_cells[:, 1]))
             fx, fy = self._grid_to_world(int(round(gx_m)), int(round(gy_m)))
@@ -197,8 +201,7 @@ class RobotControl(Node):
                 self._start_flag_navigation()
             elif self._flag_creep_ticks > 0:
                 # Creeping forward to bring flag within LiDAR range
-                if not self.obstacle_ahead:
-                    twist.linear.x = 0.2
+                twist.linear.x = 0.05
                 self._flag_creep_ticks -= 1
                 if self._flag_creep_ticks == 0:
                     self.get_logger().info('FLAG_DETECTED: crept forward — retrying')
